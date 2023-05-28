@@ -115,11 +115,18 @@ end CollectAxioms
 
 private def printAxiomsOf (constName : Name) : CommandElabM Unit := do
   let env ← getEnv
+  let info := env.find? constName |>.get!
+  let head := if info.isUnsafe then
+    m!"'{constName}' is unsafe (untrusted, can prove false)\n"
+  else if info.isPartial then
+    m!"'{constName}' is partial (untrusted, can prove false)\n"
+  else
+    m!""
   let (_, s) := ((CollectAxioms.collect constName).run env).run {}
   if s.axioms.isEmpty then
-    logInfo m!"'{constName}' does not depend on any axioms"
+    logInfo m!"{head}'{constName}' does not depend on any axioms"
   else
-    logInfo m!"'{constName}' depends on axioms: {s.axioms.toList}"
+    logInfo m!"{head}'{constName}' depends on axioms: {s.axioms.toList}"
 
 @[builtin_command_elab «printAxioms»] def elabPrintAxioms : CommandElab
   | `(#print%$tk axioms $id) => withRef tk do
