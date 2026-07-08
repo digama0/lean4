@@ -6,6 +6,12 @@ Author: Leonardo de Moura
 */
 #include <utility>
 #include <vector>
+#include <map>
+#include <string>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <sstream>
 #include "runtime/interrupt.h"
 #include "runtime/sstream.h"
 #include "runtime/flet.h"
@@ -21,6 +27,72 @@ Author: Leonardo de Moura
 #include "kernel/inductive.h"
 
 namespace lean {
+
+// ---------- diag-instr: counters + per-call hash traces ----------
+// Enable by setting env var LEAN_TC_INSTR=1 before running.
+//   LEAN_TC_INSTR_THRESH=<N>  whnf-loop iter threshold for extra trace (default 100)
+//   LEAN_TC_INSTR_HASH=1      emit hash-per-call lines for whnf/isDefEqCore/unfold
+//                             (paired with matching L4L logging so we can diff)
+static bool g_tc_instr_enabled = ([]{ return getenv("LEAN_TC_INSTR") != nullptr; })();
+static size_t g_tc_instr_thresh = ([]{
+    const char *s = getenv("LEAN_TC_INSTR_THRESH");
+    return s ? (size_t) strtoull(s, nullptr, 10) : (size_t) 100;
+})();
+static bool g_tc_instr_hash = ([]{ return getenv("LEAN_TC_INSTR_HASH") != nullptr; })();
+// Gate the intra-decl TCSTEP/TCTAG dumps from `add_theorem` / `dump_tc_step`.
+// Off by default so full-mathlib checker runs don't drown in per-decl trace.
+static bool g_tc_instr_step = ([]{ return getenv("LEAN_TC_INSTR_STEP") != nullptr; })();
+// Gate per-`is_def_eq_core` DEQ trace (one line per call, mirrors L4L `tcHashTrace`).
+static bool g_tc_instr_deq = ([]{ return getenv("LEAN_TC_INSTR_DEQ") != nullptr; })();
+
+static thread_local const char * g_tc_caller_tag = "top";
+
+struct caller_tag_scope {
+    const char * prev;
+    caller_tag_scope(const char * tag) : prev(g_tc_caller_tag) { g_tc_caller_tag = tag; }
+    ~caller_tag_scope() { g_tc_caller_tag = prev; }
+};
+
+struct tc_counters {
+    size_t whnf_calls = 0;
+    size_t whnf_cache_hits = 0;
+    size_t whnf_iters = 0;                // total loop iterations across all whnf calls
+    size_t whnf_max_iter = 0;             // max iterations in any single whnf call
+    size_t whnf_core_calls = 0;
+    size_t whnf_core_cache_hits = 0;
+    size_t unfold_calls = 0;
+    size_t is_def_eq_core_calls = 0;
+    size_t quick_is_def_eq_calls = 0;
+    size_t equiv_hits = 0;
+    size_t equiv_misses = 0;
+    /* Polynomial hash of the sequence of (t.hash, s.hash) pairs at each
+       is_def_eq_core entry. See L4L's `TypeChecker.Stats.deqFingerprint`. */
+    uint64_t deq_fingerprint = 0;
+    /* Per caller_tag_scope tag: number of is_def_eq_core entries. */
+    std::map<std::string, size_t> deq_per_tag;
+
+    void reset() { *this = tc_counters(); }
+    void dump(FILE *fp, const char *label) const {
+        fprintf(fp, "TCSTATS %s isdefeq=%zu deq_fp=%llu whnf=%zu whnfcore=%zu unfold=%zu\n",
+                label, is_def_eq_core_calls, (unsigned long long)deq_fingerprint,
+                whnf_calls, whnf_core_calls, unfold_calls);
+        fflush(fp);
+    }
+    void dump_tags(FILE *fp, const char *label) const {
+        // Sort by count desc for readable diff.
+        std::vector<std::pair<std::string, size_t>> v(deq_per_tag.begin(), deq_per_tag.end());
+        std::sort(v.begin(), v.end(), [](auto const & a, auto const & b) { return a.second > b.second; });
+        for (auto const & p : v) {
+            fprintf(fp, "TCTAG %s %s=%zu\n", label, p.first.c_str(), p.second);
+        }
+        fflush(fp);
+    }
+};
+
+static thread_local tc_counters g_tc;
+// ---------- end diag-instr ----------
+
+
 static name * g_kernel_fresh = nullptr;
 static expr * g_dont_care    = nullptr;
 static name * g_bool_true    = nullptr;
@@ -169,11 +241,15 @@ expr type_checker::infer_app(expr const & e, bool infer_only) {
         if (is_eager_reduce(app_arg(e))) {
             // If argument is of the form `eagerReduce`, set m_eager_reduction mode
             flet<bool> scope(m_eager_reduce, true);
+            caller_tag_scope tag_scope("inferApp");
             if (!is_def_eq(d_type, a_type)) {
                 throw app_type_mismatch_exception(env(), m_lctx, e, f_type, a_type);
             }
-        } else if (!is_def_eq(d_type, a_type)) {
-            throw app_type_mismatch_exception(env(), m_lctx, e, f_type, a_type);
+        } else {
+            caller_tag_scope tag_scope("inferApp");
+            if (!is_def_eq(d_type, a_type)) {
+                throw app_type_mismatch_exception(env(), m_lctx, e, f_type, a_type);
+            }
         }
         return instantiate(binding_body(f_type), app_arg(e));
     } else {
@@ -402,6 +478,7 @@ static bool is_let_fvar(local_ctx const & lctx, expr const & e) {
     We also do not cache results. */
 expr type_checker::whnf_core(expr const & e, bool cheap_rec, bool cheap_proj) {
     check_system("type checker: whnf", /* do_check_interrupted */ true);
+    if (g_tc_instr_enabled) g_tc.whnf_core_calls++;
 
     // handle easy cases
     switch (e.kind()) {
@@ -502,6 +579,7 @@ optional<expr> type_checker::unfold_definition_core(expr const & e) {
             levels const & us = const_levels(e);
             unsigned len = length(us);
             if (len == d->get_num_lparams()) {
+                if (g_tc_instr_enabled) g_tc.unfold_calls++;
                 if (m_diag) {
                     m_diag->record_unfold(d->get_name());
                 }
@@ -660,25 +738,44 @@ expr type_checker::whnf(expr const & e) {
         break;
     }
 
+    if (g_tc_instr_enabled) g_tc.whnf_calls++;
     // check cache
     auto it = m_st->m_whnf.find(e);
-    if (it != m_st->m_whnf.end())
+    if (it != m_st->m_whnf.end()) {
+        if (g_tc_instr_enabled) g_tc.whnf_cache_hits++;
         return it->second;
+    }
 
     expr t = e;
+    size_t iter = 0;
     while (true) {
+        if (g_tc_instr_enabled) { g_tc.whnf_iters++; iter++; }
         expr t1 = whnf_core(t);
         if (auto v = reduce_native(env(), t1)) {
             m_st->m_whnf.insert(mk_pair(e, *v));
+            if (g_tc_instr_enabled && iter > g_tc.whnf_max_iter) g_tc.whnf_max_iter = iter;
             return *v;
         } else if (auto v = reduce_nat(t1)) {
             m_st->m_whnf.insert(mk_pair(e, *v));
+            if (g_tc_instr_enabled && iter > g_tc.whnf_max_iter) g_tc.whnf_max_iter = iter;
             return *v;
         } else if (auto next_t = unfold_definition(t1)) {
             t = *next_t;
+            if (g_tc_instr_enabled && iter == g_tc_instr_thresh) {
+                fprintf(stderr, "WHNF_LOOP threshold hit at iter=%zu, head=", iter);
+                expr fn = get_app_fn(t1);
+                if (is_constant(fn)) {
+                    fprintf(stderr, "%s", const_name(fn).to_string().c_str());
+                } else {
+                    fprintf(stderr, "[non-const kind=%d]", (int)fn.kind());
+                }
+                fprintf(stderr, " nargs=%u\n", get_app_num_args(t1));
+                fflush(stderr);
+            }
         } else {
             auto r = t1;
             m_st->m_whnf.insert(mk_pair(e, r));
+            if (g_tc_instr_enabled && iter > g_tc.whnf_max_iter) g_tc.whnf_max_iter = iter;
             return r;
         }
     }
@@ -702,6 +799,7 @@ bool type_checker::is_def_eq_binding(expr t, expr s) {
         if (binding_domain(t) != binding_domain(s)) {
             var_s_type = instantiate_rev(binding_domain(s), subst.size(), subst.data());
             expr var_t_type = instantiate_rev(binding_domain(t), subst.size(), subst.data());
+            caller_tag_scope tag_scope(k == expr_kind::Lambda ? "lambdaDom" : "forallDom");
             if (!is_def_eq(var_t_type, *var_s_type))
                 return false;
         }
@@ -716,6 +814,7 @@ bool type_checker::is_def_eq_binding(expr t, expr s) {
         t = binding_body(t);
         s = binding_body(s);
     } while (t.kind() == k && s.kind() == k);
+    caller_tag_scope tag_scope(k == expr_kind::Lambda ? "lambdaBody" : "forallBody");
     return is_def_eq(instantiate_rev(t, subst.size(), subst.data()),
                      instantiate_rev(s, subst.size(), subst.data()));
 }
@@ -742,16 +841,22 @@ bool type_checker::is_def_eq(levels const & ls1, levels const & ls2) {
 
 /** \brief This is an auxiliary method for is_def_eq. It handles the "easy cases". */
 lbool type_checker::quick_is_def_eq(expr const & t, expr const & s, bool use_hash) {
-    if (m_st->m_eqv_manager.is_equiv(t, s, use_hash))
+    if (g_tc_instr_enabled) g_tc.quick_is_def_eq_calls++;
+    if (m_st->m_eqv_manager.is_equiv(t, s, use_hash)) {
+        if (g_tc_instr_enabled) g_tc.equiv_hits++;
         return l_true;
+    }
+    if (g_tc_instr_enabled) g_tc.equiv_misses++;
     if (t.kind() == s.kind()) {
         switch (t.kind()) {
         case expr_kind::Lambda: case expr_kind::Pi:
             return to_lbool(is_def_eq_binding(t, s));
         case expr_kind::Sort:
             return to_lbool(is_def_eq(sort_level(t), sort_level(s)));
-        case expr_kind::MData:
+        case expr_kind::MData: {
+            caller_tag_scope tag_scope("mdata");
             return to_lbool(is_def_eq(mdata_expr(t), mdata_expr(s)));
+        }
         case expr_kind::MVar:
             lean_unreachable(); // LCOV_EXCL_LINE
         case expr_kind::BVar:   case expr_kind::FVar: case expr_kind::App:
@@ -769,6 +874,7 @@ lbool type_checker::quick_is_def_eq(expr const & t, expr const & s, bool use_has
 /** \brief Return true if arguments of \c t are definitionally equal to arguments of \c s.
     This method is used to implement an optimization in the method \c is_def_eq. */
 bool type_checker::is_def_eq_args(expr t, expr s) {
+    caller_tag_scope tag_scope("isDefEqArgs");
     while (is_app(t) && is_app(s)) {
         if (!is_def_eq(app_arg(t), app_arg(s)))
             return false;
@@ -785,6 +891,7 @@ bool type_checker::try_eta_expansion_core(expr const & t, expr const & s) {
         if (!is_pi(s_type))
             return false;
         expr new_s  = mk_lambda(binding_name(s_type), binding_domain(s_type), mk_app(s, mk_bvar(0)), binding_info(s_type));
+        caller_tag_scope tag_scope("etaExpand");
         if (!is_def_eq(t, new_s))
             return false;
         return true;
@@ -802,13 +909,17 @@ bool type_checker::try_eta_struct_core(expr const & t, expr const & s) {
     constructor_val f_val = f_info.to_constructor_val();
     if (get_app_num_args(s) != f_val.get_nparams() + f_val.get_nfields()) return false;
     if (!is_structure_like(env(), f_val.get_induct())) return false;
-    // Force left-to-right evaluation (C++ arg order is unspecified) so
-    // `infer_type(t)` runs before `infer_type(s)`, matching lean4lean.
-    expr t_type = infer_type(t);
-    expr s_type = infer_type(s);
-    if (!is_def_eq(t_type, s_type)) return false;
+    {
+        caller_tag_scope tag_scope("etaStruct.type");
+        // Force left-to-right evaluation (C++ arg order is unspecified) so
+        // `infer_type(t)` runs before `infer_type(s)`, matching lean4lean.
+        expr t_type = infer_type(t);
+        expr s_type = infer_type(s);
+        if (!is_def_eq(t_type, s_type)) return false;
+    }
     buffer<expr> s_args;
     get_app_args(s, s_args);
+    caller_tag_scope tag_scope("etaStruct.proj");
     for (unsigned i = f_val.get_nparams(); i < s_args.size(); i++) {
         expr proj = mk_proj(f_val.get_induct(), i - f_val.get_nparams(), t);
         if (!is_def_eq(proj, s_args[i])) return false;
@@ -826,15 +937,19 @@ bool type_checker::is_def_eq_app(expr const & t, expr const & s) {
         buffer<expr> s_args;
         expr t_fn = get_app_args(t, t_args);
         expr s_fn = get_app_args(s, s_args);
-        if (is_def_eq(t_fn, s_fn) && t_args.size() == s_args.size()) {
-            unsigned i = 0;
-            for (; i < t_args.size(); i++) {
-                if (!is_def_eq(t_args[i], s_args[i]))
-                    break;
-            }
-            if (i == t_args.size())
-                return true;
+        {
+            caller_tag_scope tag_scope("isDefEqApp.fn");
+            if (!is_def_eq(t_fn, s_fn) || t_args.size() != s_args.size())
+                return false;
         }
+        caller_tag_scope tag_scope("isDefEqApp.arg");
+        unsigned i = 0;
+        for (; i < t_args.size(); i++) {
+            if (!is_def_eq(t_args[i], s_args[i]))
+                break;
+        }
+        if (i == t_args.size())
+            return true;
     }
     return false;
 }
@@ -847,6 +962,7 @@ lbool type_checker::is_def_eq_proof_irrel(expr const & t, expr const & s) {
     if (!is_prop(t_type))
         return l_undef;
     expr s_type = infer_type(s);
+    caller_tag_scope tag_scope("proofIrrel");
     return to_lbool(is_def_eq(t_type, s_type));
 }
 
@@ -928,6 +1044,7 @@ auto type_checker::lazy_delta_reduction_step(expr & t_n, expr & s_n) -> reductio
                 // If they are, then t_n and s_n must be definitionally equal, and we can
                 // skip the delta-reduction step.
                 if (!failed_before(t_n, s_n)) {
+                    caller_tag_scope tag_scope("lazyDelta.regular");
                     if (is_def_eq(const_levels(get_app_fn(t_n)), const_levels(get_app_fn(s_n))) &&
                         is_def_eq_args(t_n, s_n)) {
                         return reduction_status::DefEqual;
@@ -972,6 +1089,7 @@ lbool type_checker::is_def_eq_offset(expr const & t, expr const & s) {
     optional<expr> pred_t = is_nat_succ(t);
     optional<expr> pred_s = is_nat_succ(s);
     if (pred_t && pred_s) {
+        caller_tag_scope tag_scope("natSucc");
         return to_lbool(is_def_eq_core(*pred_t, *pred_s));
     }
     return l_undef;
@@ -985,15 +1103,19 @@ lbool type_checker::lazy_delta_reduction(expr & t_n, expr & s_n) {
 
         if ((!has_fvar(t_n) && !has_fvar(s_n)) || m_eager_reduce) {
             if (auto t_v = reduce_nat(t_n)) {
+                caller_tag_scope tag_scope("reduceNat_t");
                 return to_lbool(is_def_eq_core(*t_v, s_n));
             } else if (auto s_v = reduce_nat(s_n)) {
+                caller_tag_scope tag_scope("reduceNat_s");
                 return to_lbool(is_def_eq_core(t_n, *s_v));
             }
         }
 
         if (auto t_v = reduce_native(env(), t_n)) {
+            caller_tag_scope tag_scope("reduceNative_t");
             return to_lbool(is_def_eq_core(*t_v, s_n));
         } else if (auto s_v = reduce_native(env(), s_n)) {
+            caller_tag_scope tag_scope("reduceNative_s");
             return to_lbool(is_def_eq_core(t_n, *s_v));
         }
 
@@ -1037,6 +1159,7 @@ static expr * g_string_mk = nullptr;
 
 lbool type_checker::try_string_lit_expansion_core(expr const & t, expr const & s) {
     if (is_string_lit(t) && is_app(s) && app_fn(s) == *g_string_mk) {
+        caller_tag_scope tag_scope("strLit");
         return to_lbool(is_def_eq_core(whnf(string_lit_to_constructor(t)), s));
     }
     return l_undef;
@@ -1058,11 +1181,56 @@ bool type_checker::is_def_eq_unit_like(expr const & t, expr const & s) {
     constructor_val ctor_val = env().get(ctor_name).to_constructor_val();
     if (ctor_val.get_nfields() != 0)
         return false;
+    caller_tag_scope tag_scope("unitLike");
     return is_def_eq_core(t_type, infer_type(s));
+}
+
+static std::string head_str_for_trace(expr const & e) {
+    switch (e.kind()) {
+    case expr_kind::BVar:  return std::string("bvar_") + std::to_string(bvar_idx(e).get_small_value());
+    case expr_kind::FVar:  return std::string("fvar_") + fvar_name(e).to_string();
+    case expr_kind::MVar:  return std::string("mvar_") + mvar_name(e).to_string();
+    case expr_kind::Sort:  return "Sort";
+    case expr_kind::Const: return const_name(e).to_string();
+    case expr_kind::Lambda: return "λ";
+    case expr_kind::Pi: return "∀";
+    case expr_kind::Let: return "let";
+    case expr_kind::MData: return "mdata";
+    case expr_kind::Lit: return "lit";
+    case expr_kind::Proj: return std::string("proj_") + proj_sname(e).to_string() + "_" + std::to_string(proj_idx(e).get_small_value());
+    case expr_kind::App: {
+        expr const & f = get_app_fn(e);
+        unsigned n = get_app_num_args(e);
+        std::string h;
+        switch (f.kind()) {
+        case expr_kind::Const: h = const_name(f).to_string(); break;
+        case expr_kind::Lambda: h = "λ"; break;
+        case expr_kind::FVar: h = std::string("fvar_") + fvar_name(f).to_string(); break;
+        case expr_kind::Proj: h = std::string("proj_") + proj_sname(f).to_string() + "_" + std::to_string(proj_idx(f).get_small_value()); break;
+        default: h = "?"; break;
+        }
+        return h + "(" + std::to_string(n) + ")";
+    }
+    }
+    return "?";
 }
 
 bool type_checker::is_def_eq_core(expr const & t, expr const & s) {
     check_system("is_definitionally_equal", /* do_check_interrupted */ true);
+    if (g_tc_instr_enabled) {
+        g_tc.is_def_eq_core_calls++;
+        uint64_t th = (uint64_t) hash(t);
+        uint64_t sh = (uint64_t) hash(s);
+        g_tc.deq_fingerprint = g_tc.deq_fingerprint * 1099511628211ULL + th * 65537ULL + sh;
+        const char * tag = g_tc_caller_tag ? g_tc_caller_tag : "top";
+        g_tc.deq_per_tag[tag]++;
+        if (g_tc_instr_deq) {
+            fprintf(stderr, "DEQ [%s] t=%llu s=%llu tk=%s sk=%s\n",
+                    tag, (unsigned long long) th, (unsigned long long) sh,
+                    head_str_for_trace(t).c_str(), head_str_for_trace(s).c_str());
+            fflush(stderr);
+        }
+    }
     bool use_hash = true;
     lbool r = quick_is_def_eq(t, s, use_hash);
     if (r != l_undef) return r == l_true;
@@ -1109,6 +1277,7 @@ bool type_checker::is_def_eq_core(expr const & t, expr const & s) {
     if (is_proj(t_n) && is_proj(s_n) && proj_idx(t_n) == proj_idx(s_n)) {
         expr t_c = proj_expr(t_n);
         expr s_c = proj_expr(s_n);
+        caller_tag_scope tag_scope("projInner");
         if (lazy_delta_proj_reduction(t_c, s_c, proj_idx(t_n)))
             return true;
     }
@@ -1116,8 +1285,10 @@ bool type_checker::is_def_eq_core(expr const & t, expr const & s) {
     // Invoke `whnf_core` again, but now using `whnf` to reduce projections.
     expr t_n_n = whnf_core(t_n);
     expr s_n_n = whnf_core(s_n);
-    if (!is_eqp(t_n_n, t_n) || !is_eqp(s_n_n, s_n))
+    if (!is_eqp(t_n_n, t_n) || !is_eqp(s_n_n, s_n)) {
+        caller_tag_scope tag_scope("reWhnf");
         return is_def_eq_core(t_n_n, s_n_n);
+    }
 
     // At this point, t_n and s_n are in weak head normal form (modulo metavariables and proof irrelevance)
     if (is_def_eq_app(t_n, s_n))
@@ -1171,6 +1342,10 @@ expr type_checker::eta_expand(expr const & e) {
 type_checker::type_checker(environment const & env, local_ctx const & lctx, diagnostics * diag, definition_safety ds):
     m_st_owner(true), m_st(new state(env)), m_diag(diag),
     m_lctx(lctx), m_definition_safety(ds), m_lparams(nullptr) {
+    // Reset per-checker accumulator so each addDecl (which creates its own
+    // type_checker in add_theorem/add_definition/etc.) starts fresh, matching
+    // lean4lean's per-M.run state.
+    if (g_tc_instr_enabled) g_tc.reset();
 }
 
 type_checker::type_checker(state & st, local_ctx const & lctx, definition_safety ds):
@@ -1185,8 +1360,29 @@ type_checker::type_checker(type_checker && src):
 }
 
 type_checker::~type_checker() {
-    if (m_st_owner)
+    if (m_st_owner) {
+        // Dump the accumulated counters here (not at end of each `check`), so
+        // any final `is_def_eq(val_type, type)` calls in `add_theorem` etc. are
+        // included in the reported fingerprint — matching lean4lean which
+        // accumulates over the whole M.run per decl.
+        if (g_tc_instr_enabled) {
+            g_tc.dump(stderr, "checker_end");
+            g_tc.dump_tags(stderr, "checker_end");
+        }
         delete m_st;
+    }
+}
+
+// Debug helper: emit a labelled snapshot of the current per-checker counters
+// so we can pinpoint which step in `add_theorem` accounts for a divergence.
+void dump_tc_step(const char * label) {
+    if (g_tc_instr_enabled && g_tc_instr_step) {
+        fprintf(stderr, "TCSTEP %s isdefeq=%zu deq_fp=%llu\n",
+                label, g_tc.is_def_eq_core_calls,
+                (unsigned long long) g_tc.deq_fingerprint);
+        g_tc.dump_tags(stderr, label);
+        fflush(stderr);
+    }
 }
 
 inline static expr * new_persistent_expr_const(name const & n) {

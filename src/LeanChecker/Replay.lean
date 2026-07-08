@@ -62,6 +62,15 @@ def throwKernelException (ex : Kernel.Exception) : M Unit := do
 
 /-- Add a declaration, possibly throwing a `Kernel.Exception`. -/
 def addDecl (d : Declaration) : M Unit := do
+  -- match L4L's DECL marker so hash-log diffs align across kernels
+  if (← IO.getEnv "LEAN_TC_INSTR").isSome then
+    let n : Name := match d with
+      | .axiomDecl v => v.name
+      | .defnDecl v => v.name
+      | .thmDecl v => v.name
+      | .opaqueDecl v => v.name
+      | _ => `_other
+    IO.eprintln s!"DECL {n}"
   match (← get).env.addDeclCore 0 d (cancelTk? := none) with
   | .ok env => modify fun s => { s with env := env }
   | .error ex => throwKernelException ex

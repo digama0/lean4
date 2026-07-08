@@ -197,13 +197,18 @@ environment environment::add_theorem(declaration const & d, bool check) const {
         sharecommon_persistent_fn share;
         expr val(share(v.get_value().raw()));
         expr type(share(v.get_type().raw()));
+        dump_tc_step("thm.start");
         if (!checker.is_prop(type))
             throw theorem_type_is_not_prop(*this, v.get_name(), type);
+        dump_tc_step("thm.after_is_prop");
         check_constant_val(*this, v.to_constant_val(), checker);
+        dump_tc_step("thm.after_check_const_val");
         check_no_metavar_no_fvar(*this, v.get_name(), val);
         expr val_type = checker.check(val, v.get_lparams());
+        dump_tc_step("thm.after_check_val");
         if (!checker.is_def_eq(val_type, type))
             throw definition_type_mismatch_exception(*this, d, val_type);
+        dump_tc_step("thm.after_final_defeq");
     }
     return diag.update(add(constant_info(d)));
 }

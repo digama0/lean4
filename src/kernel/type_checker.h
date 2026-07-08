@@ -171,4 +171,7 @@ public:
 
 void initialize_type_checker();
 void finalize_type_checker();
+
+// Debug helper: emit a labelled snapshot of the current per-checker counters.
+void dump_tc_step(const char * label);
 }
