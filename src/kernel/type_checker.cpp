@@ -119,11 +119,12 @@ expr type_checker::infer_lambda(expr const & _e, bool infer_only) {
     expr e = _e;
     while (is_lambda(e)) {
         expr d    = instantiate_rev(binding_domain(e), fvars.size(), fvars.data());
-        expr fvar = m_lctx.mk_local_decl(m_st->m_ngen, binding_name(e), d, binding_info(e));
-        fvars.push_back(fvar);
+        // Match lean4lean order: ensure_sort_core BEFORE fvar creation.
         if (!infer_only) {
             ensure_sort_core(infer_type_core(d, infer_only), d);
         }
+        expr fvar = m_lctx.mk_local_decl(m_st->m_ngen, binding_name(e), d, binding_info(e));
+        fvars.push_back(fvar);
         e = binding_body(e);
     }
     expr r = infer_type_core(instantiate_rev(e, fvars.size(), fvars.data()), infer_only);
@@ -168,10 +169,10 @@ expr type_checker::infer_app(expr const & e, bool infer_only) {
         if (is_eager_reduce(app_arg(e))) {
             // If argument is of the form `eagerReduce`, set m_eager_reduction mode
             flet<bool> scope(m_eager_reduce, true);
-            if (!is_def_eq(a_type, d_type)) {
+            if (!is_def_eq(d_type, a_type)) {
                 throw app_type_mismatch_exception(env(), m_lctx, e, f_type, a_type);
             }
-        } else if (!is_def_eq(a_type, d_type)) {
+        } else if (!is_def_eq(d_type, a_type)) {
             throw app_type_mismatch_exception(env(), m_lctx, e, f_type, a_type);
         }
         return instantiate(binding_body(f_type), app_arg(e));
@@ -202,8 +203,7 @@ expr type_checker::infer_let(expr const & _e, bool infer_only) {
     while (is_let(e)) {
         expr type = instantiate_rev(let_type(e), fvars.size(), fvars.data());
         expr val  = instantiate_rev(let_value(e), fvars.size(), fvars.data());
-        expr fvar = m_lctx.mk_local_decl(m_st->m_ngen, let_name(e), type, val);
-        fvars.push_back(fvar);
+        // Match lean4lean `inferLet` order: check `type`/`val` BEFORE extending the context.
         if (!infer_only) {
             ensure_sort_core(infer_type_core(type, infer_only), type);
             expr val_type = infer_type_core(val, infer_only);
@@ -211,6 +211,8 @@ expr type_checker::infer_let(expr const & _e, bool infer_only) {
                 throw def_type_mismatch_exception(env(), m_lctx, let_name(e), val_type, type);
             }
         }
+        expr fvar = m_lctx.mk_local_decl(m_st->m_ngen, let_name(e), type, val);
+        fvars.push_back(fvar);
         e = let_body(e);
     }
     expr r = infer_type_core(instantiate_rev(e, fvars.size(), fvars.data()), infer_only);
@@ -800,7 +802,11 @@ bool type_checker::try_eta_struct_core(expr const & t, expr const & s) {
     constructor_val f_val = f_info.to_constructor_val();
     if (get_app_num_args(s) != f_val.get_nparams() + f_val.get_nfields()) return false;
     if (!is_structure_like(env(), f_val.get_induct())) return false;
-    if (!is_def_eq(infer_type(t), infer_type(s))) return false;
+    // Force left-to-right evaluation (C++ arg order is unspecified) so
+    // `infer_type(t)` runs before `infer_type(s)`, matching lean4lean.
+    expr t_type = infer_type(t);
+    expr s_type = infer_type(s);
+    if (!is_def_eq(t_type, s_type)) return false;
     buffer<expr> s_args;
     get_app_args(s, s_args);
     for (unsigned i = f_val.get_nparams(); i < s_args.size(); i++) {
